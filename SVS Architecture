@@ -1,0 +1,1922 @@
+1. System Architecture Overview
+┌─────────────────────────────────────────────────────────────────────┐
+│                        APPLICATION LAYER (SVApp)                     │
+│  ┌────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────┐ │
+│  │ Threading  │  │ Event Loop   │  │ Timing       │  │ Config    │ │
+│  │ ThreadPool │  │ Run/Init     │  │ Control      │  │ Management│ │
+│  └────────────┘  └──────────────┘  └──────────────┘  └───────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
+         │                    │                    │
+         ▼                    ▼                    ▼
+┌──────────────────┐  ┌──────────────────┐  ┌─────────────────┐
+│  INPUT LAYER     │  │  PROCESSING      │  │  OUTPUT LAYER   │
+│  (SVCamera)      │  │  LAYER           │  │  (SVRender +    │
+│                  │  │  (SVStitcher)    │  │   SVDisplay)    │
+└──────────────────┘  └──────────────────┘  └─────────────────┘
+```
+
+---
+
+## 2. **Detailed Component Architecture**
+
+### **A. INPUT SUBSYSTEM (Camera Capture)**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    MultiCameraSource                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │ CameraSource │  │ CameraSource │  │ CameraSource │  ...x4   │
+│  │ /dev/video0  │  │ /dev/video1  │  │ /dev/video2  │          │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
+│         │                  │                  │                   │
+│         └──────────────────┴──────────────────┘                  │
+│                            │                                      │
+│                    ┌───────▼────────┐                            │
+│                    │  select() sync │  ← Hardware sync           │
+│                    └───────┬────────┘                            │
+│                            │                                      │
+│         ┌──────────────────┴──────────────────┐                 │
+│         │                                       │                 │
+│    ┌────▼─────┐  ┌──────────────┐  ┌─────────▼────────┐       │
+│    │ V4L2     │  │ CUDA UYVY→RGB│  │ Undistortion     │       │
+│    │ mmap(4x) │→ │ Conversion   │→ │ cv::cuda::remap  │       │
+│    └──────────┘  └──────────────┘  └──────────────────┘       │
+│                                                                   │
+│  Data Structures:                                                │
+│  • InternalCameraParams: K matrix + distortion coefficients     │
+│  • CameraUndistortData: remapX, remapY lookup tables           │
+│  • Frame: cv::cuda::GpuMat wrapper                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Files:**
+- `src/SVCamera.cpp` - V4L2 driver interface
+- `cusrc/yuv2rgb.cu` - CUDA color conversion kernel
+
+**Data Flow:**
+```
+V4L2 Buffer → CUDA Memory → YUV→RGB Conversion → 
+Undistortion (remap) → GPU Frame Output
+```
+
+---
+
+### **B. PROCESSING SUBSYSTEM (Image Stitching Pipeline)**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         SVStitcher                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  INITIALIZATION PHASE (initFromFile / init):                    │
+│  ┌────────────────────────────────────────────────────────────┐│
+│  │ 1. SVAutoCalib (optional)                                  ││
+│  │    • ORB feature detection                                 ││
+│  │    • Homography estimation                                 ││
+│  │    • Bundle adjustment                                     ││
+│  │    • Output: K matrices, Rotation matrices, focal length  ││
+│  │                                                             ││
+│  │ 2. SVSeamDetector                                          ││
+│  │    • Spherical warping (cv::SphericalWarper)              ││
+│  │    • Exposure compensation (GAIN_BLOCKS)                   ││
+│  │    • Seam finding (DP_SEAM algorithm)                      ││
+│  │    • Dilate masks                                          ││
+│  │    • Output: corners, sizes, seam masks, warp maps        ││
+│  │                                                             ││
+│  │ 3. SVMultiBandBlender preparation                          ││
+│  │    • Build Laplacian pyramid structure (4 bands)           ││
+│  │    • Build Gaussian weight pyramids                        ││
+│  │    • Compute ROI and borders for each image               ││
+│  │                                                             ││
+│  │ 4. Perspective warp computation                            ││
+│  │    • Detect corners (contour analysis)                     ││
+│  │    • Compute transform matrix                              ││
+│  │    • Build warp perspective maps                           ││
+│  └────────────────────────────────────────────────────────────┘│
+│                                                                   │
+│  RUNTIME PHASE (stitch):                                         │
+│  ┌────────────────────────────────────────────────────────────┐│
+│  │                                                             ││
+│  │  For each camera frame (parallel OpenMP):                  ││
+│  │  ┌─────────────────────────────────────────────────────┐  ││
+│  │  │ 1. Resize (scale_factor=0.65)                       │  ││
+│  │  │ 2. Spherical warp (cv::cuda::remap)                 │  ││
+│  │  │ 3. Exposure compensation (multiply by gain)         │  ││
+│  │  │ 4. Convert to CV_16S                                │  ││
+│  │  │ 5. Feed to multi-band blender                       │  ││
+│  │  └─────────────────────────────────────────────────────┘  ││
+│  │                                                             ││
+│  │  Multi-Band Blending (GPU):                                ││
+│  │  ┌─────────────────────────────────────────────────────┐  ││
+│  │  │ For each image:                                     │  ││
+│  │  │   • Build Laplacian pyramid (4 levels)              │  ││
+│  │  │   • Weight by Gaussian pyramid                      │  ││
+│  │  │   • Accumulate weighted Laplacians                  │  ││
+│  │  │                                                      │  ││
+│  │  │ Collapse pyramid (reconstruct):                     │  ││
+│  │  │   • pyrUp level 4 → add to level 3                  │  ││
+│  │  │   • pyrUp level 3 → add to level 2                  │  ││
+│  │  │   • pyrUp level 2 → add to level 1                  │  ││
+│  │  │   • pyrUp level 1 → add to level 0                  │  ││
+│  │  └─────────────────────────────────────────────────────┘  ││
+│  │                                                             ││
+│  │  6. Perspective warp (crop to rectangle)                   ││
+│  │  7. Extract ROI (row_range, col_range)                     ││
+│  │                                                             ││
+│  └────────────────────────────────────────────────────────────┘│
+│                                                                   │
+│  BACKGROUND TASKS (async via ThreadPool):                        │
+│  • recomputeGain() - every 10 seconds                           │
+│  • recomputeToneLuminance() - every 7 seconds                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Files:**
+- `src/SVStitcher.cpp` - Main stitching orchestrator
+- `src/SVAutoCalib.cpp` - Feature-based calibration
+- `src/SVSeamDetection.cpp` - Seam finding
+- `src/SVBlender.cpp` - Multi-band blending
+- `src/SVGainCompensator.cpp` - Exposure correction
+- `cusrc/kernelblend.cu` - CUDA blending kernels
+
+**Algorithms Used:**
+- **Feature Detection**: ORB (Oriented FAST + Rotated BRIEF)
+- **Matching**: BestOf2NearestMatcher
+- **Warping**: Spherical projection
+- **Seam Finding**: Dynamic Programming (DP_SEAM)
+- **Blending**: Laplacian Pyramid Multi-Band
+- **Exposure**: Channel-based gain compensation
+
+---
+
+### **C. OUTPUT SUBSYSTEM (3D Rendering)**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SVRender + SVDisplayView                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  GEOMETRY GENERATION:                                            │
+│  ┌────────────────────────────────────────────────────────────┐│
+│  │ Bowl / HemiSphere (src/Bowl.cpp)                           ││
+│  │                                                             ││
+│  │  Parametric Surface:                                       ││
+│  │  • x = r * cos(θ)                                          ││
+│  │  • z = r * sin(θ)                                          ││
+│  │  • y = c * (x²/a² + z²/b²)   [Paraboloid]                 ││
+│  │    OR                                                       ││
+│  │  • Hemisphere: xPos = cos(θ)*sin(φ)                        ││
+│  │                yPos = 1 - cos(φ)                            ││
+│  │                zPos = sin(θ)*sin(φ)                         ││
+│  │                                                             ││
+│  │  UV Mapping: u = θ/(2π), v = r/r_max                       ││
+│  │                                                             ││
+│  │  Output: vertices[], indices[] (triangle strip)            ││
+│  └────────────────────────────────────────────────────────────┘│
+│                                                                   │
+│  RENDERING PIPELINE:                                             │
+│  ┌────────────────────────────────────────────────────────────┐│
+│  │                                                             ││
+│  │  1. OFFSCREEN PASS (Framebuffer):                          ││
+│  │     ┌─────────────────────────────────────────────────┐   ││
+│  │     │ a) Draw Surround View Bowl                      │   ││
+│  │     │    • Bind stitched texture                       │   ││
+│  │     │    • Apply tone mapping shader                   │   ││
+│  │     │    • Draw bowl mesh (GL_TRIANGLE_STRIP)         │   ││
+│  │     │                                                   │   ││
+│  │     │ b) Draw Black Rectangle (ground plane)           │   ││
+│  │     │    • Cover bowl hole                             │   ││
+│  │     │                                                   │   ││
+│  │     │ c) Draw 3D Car Model                             │   ││
+│  │     │    • ASSIMP loaded .obj file                     │   ││
+│  │     │    • Phong shading                               │   ││
+│  │     │    • Transform: translate, rotate, scale         │   ││
+│  │     └─────────────────────────────────────────────────┘   ││
+│  │                                                             ││
+│  │  2. SCREEN PASS (Default Framebuffer):                     ││
+│  │     • Render fullscreen quad                               ││
+│  │     • Texture = offscreen framebuffer                      ││
+│  │                                                             ││
+│  └────────────────────────────────────────────────────────────┘│
+│                                                                   │
+│  CUDA-OPENGL INTEROP (SVCudaOGL):                               │
+│  ┌────────────────────────────────────────────────────────────┐│
+│  │                                                             ││
+│  │  cv::cuda::GpuMat → OpenGL Texture (zero-copy):            ││
+│  │                                                             ││
+│  │  1. cudaGraphicsGLRegisterBuffer(glBuffer)                 ││
+│  │  2. cudaGraphicsMapResources()                             ││
+│  │  3. cudaGraphicsResourceGetMappedPointer(&devicePtr)       ││
+│  │  4. cudaMemcpy2D(devicePtr, gpuMat.data, ...)             ││
+│  │  5. glTexSubImage2D(texture, devicePtr)                    ││
+│  │  6. cudaGraphicsUnmapResources()                           ││
+│  │                                                             ││
+│  └────────────────────────────────────────────────────────────┘│
+│                                                                   │
+│  SHADERS:                                                        │
+│  • surroundvert.glsl / surroundfrag.glsl                        │
+│    - Reinhard tone mapping                                      │
+│    - Gamma correction (γ=2.2)                                   │
+│    - Seamless blending at 0°/360° boundary                      │
+│  • modelshadervert.glsl / modelshaderfrag.glsl                  │
+│    - Basic Phong shading for car                                │
+│  • frame_screenvert.glsl / frame_screenfrag.glsl                │
+│    - Fullscreen quad rendering                                  │
+│  • blackrectshadervert.glsl / blackrectshaderfrag.glsl          │
+│    - Ground plane                                               │
+└─────────────────────────────────────────────────────────────────┘
+
+3. Data Structure Architecture
+Critical Data Structures
+
+// CAMERA LAYER
+struct Frame {
+    cv::cuda::GpuMat gpuFrame;  // GPU memory, 3-channel BGR
+};
+
+struct InternalCameraParams {
+    cv::Size resolution;
+    std::array<double, 9> K;           // 3x3 intrinsic matrix
+    std::array<double, 14> distortion; // Rational distortion model
+};
+
+struct CameraUndistortData {
+    cv::cuda::GpuMat remapX, remapY;   // Lookup tables
+    cv::cuda::GpuMat undistFrame;       // Output buffer
+    cv::Rect roiFrame;                  // Valid region
+};
+
+// STITCHING LAYER
+class SVStitcher {
+    std::vector<cv::cuda::GpuMat> gpu_seam_masks;    // Per-image masks
+    std::vector<cv::Point> corners;                   // Warped positions
+    std::vector<cv::Size> sizes;                      // Warped sizes
+    std::vector<cv::cuda::GpuMat> texXmap, texYmap;   // Warp maps
+    cv::cuda::GpuMat warpXmap, warpYmap;              // Perspective maps
+    cv::Range row_range, col_range;                   // Final crop
+    
+    std::shared_ptr<SVMultiBandBlender> cuBlender;
+    std::shared_ptr<SVChannelCompensator> svGainComp;
+};
+
+// BLENDING LAYER
+class SVMultiBandBlender {
+    std::vector<cv::cuda::GpuMat> gpu_dst_pyr_laplace_;      // Laplacian pyramid
+    std::vector<cv::cuda::GpuMat> gpu_dst_band_weights_;     // Weight pyramid
+    std::vector<std::vector<cv::cuda::GpuMat>> gpu_src_pyr_laplace_vec_;
+    std::vector<std::vector<cv::cuda::GpuMat>> gpu_weight_pyr_gauss_vec_;
+    int numbands;  // Pyramid levels (default: 4)
+};
+
+// RENDERING LAYER
+struct OGLBuffer {
+    GLuint VAO, VBO, EBO;              // OpenGL buffers
+    uint indexBuffer;                   // Index count
+    Shader OGLShader;                   // GLSL program
+    GLuint framebuffer, renderbuffer;   // Offscreen render target
+    GLuint framebuffer_tex;             // Color attachment
+};
+
+struct ConfigBowl {
+    float a, b, c;           // Paraboloid parameters
+    float disk_radius;       // Inner flat disk
+    float parab_radius;      // Outer curved radius
+    float hole_radius;       // Center hole
+    float vertices_num;      // Mesh resolution
+    glm::mat4 transformation;
+};
+```
+
+---
+
+## 4. **Threading & Synchronization Architecture**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      MAIN THREAD (SVApp::run)                    │
+│                                                                   │
+│  while (!finish) {                                               │
+│      1. Capture frames (select() blocks for sync)               │
+│      2. Stitch images (OpenMP parallel)                         │
+│      3. Render (OpenGL)                                          │
+│      4. Swap buffers (GLFW)                                      │
+│      5. Enqueue background tasks if timers expired              │
+│  }                                                                │
+└─────────────────────────────────────────────────────────────────┘
+         │                                    │
+         │                                    │
+         ▼                                    ▼
+┌──────────────────────┐           ┌──────────────────────┐
+│ CUDA STREAMS         │           │ THREAD POOL          │
+│ (Asynchronous GPU)   │           │ (CPU Workers x2)     │
+├──────────────────────┤           ├──────────────────────┤
+│ • _cudaStream[0..3]  │           │ Background Tasks:    │
+│   YUV conversion     │           │ • recomputeGain()    │
+│                      │           │   Every 10 sec       │
+│ • streamObj          │           │                      │
+│   Main stitching     │           │ • recomputeTone      │
+│                      │           │   Luminance()        │
+│ • loopStreamObj      │           │   Every 7 sec        │
+│   Per-image warping  │           └──────────────────────┘
+│                      │
+│ • photoStreamObj     │
+│   Exposure comp      │
+└──────────────────────┘
+
+OpenMP Parallel Regions:
+- Camera capture loop (4 cameras)
+- Stitch loop (5 images after rear split)
+- Blender pyramid reset
+```
+
+**Synchronization Points:**
+1. **V4L2 select()**: Hardware-level camera synchronization
+2. **CUDA stream sync**: Implicit at kernel boundaries
+3. **OpenMP barriers**: At end of parallel regions
+4. **ThreadPool futures**: For async task completion
+
+---
+
+## 5. **Memory Architecture**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         MEMORY LAYOUT                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  HOST MEMORY (CPU):                                              │
+│  • V4L2 mmap buffers (4 cameras × 4 buffers)                    │
+│  • Calibration parameters (K, dist matrices)                     │
+│  • Configuration structs                                         │
+│  • Temporary download buffers (CPU ↔ GPU transfers)             │
+│                                                                   │
+│  DEVICE MEMORY (GPU):                                            │
+│  ┌────────────────────────────────────────────────────────────┐│
+│  │ PERSISTENT ALLOCATIONS:                                    ││
+│  │ • Undistortion maps: remapX, remapY (4 cameras)            ││
+│  │ • Seam masks (5 images after rear split)                   ││
+│  │ • Spherical warp maps: texXmap, texYmap (5 images)         ││
+│  │ • Perspective warp maps: warpXmap, warpYmap                ││
+│  │ • Laplacian pyramids (5 levels × 5 images)                 ││
+│  │ • Weight pyramids (5 levels × 5 images)                    ││
+│  │ • Gain compensation buffers                                ││
+│  └────────────────────────────────────────────────────────────┘│
+│                                                                   │
+│  ┌────────────────────────────────────────────────────────────┐│
+│  │ PER-FRAME ALLOCATIONS:                                     ││
+│  │ • Raw camera frames: 1280×720×3 × 4 = ~10.5 MB             ││
+│  │ • Undistorted frames: ~10.5 MB                             ││
+│  │ • Scaled warped frames (0.65×): ~4.5 MB × 5                ││
+│  │ • Blended output: ~1.2 MB                                  ││
+│  │ • Tone mapping temps: ~1 MB                                ││
+│  │                                                             ││
+│  │ Total per-frame working set: ~40 MB                        ││
+│  └────────────────────────────────────────────────────────────┘│
+│                                                                   │
+│  SHARED MEMORY (CUDA-OpenGL):                                    │
+│  • Pixel Unpack Buffer (PBO) for zero-copy texture upload       │
+│  • Registered with cudaGraphicsGLRegisterBuffer()               │
+│                                                                   │
+│  OPENGL MEMORY:                                                  │
+│  • Surround texture: 1955×332 RGB = ~2 MB                       │
+│  • Bowl geometry VBO: ~750 vertices × 5 floats = ~15 KB         │
+│  • Car model meshes: Variable (Dodge Challenger ~500 KB)        │
+│  • Framebuffer: 1280×720 RGB + depth = ~3.3 MB                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Memory Optimization Strategies:**
+- **Zero-copy**: CUDA managed memory for camera buffers
+- **Reuse**: Pre-allocated pyramids, never deallocated
+- **Streaming**: CUDA streams for async operations
+- **ROI**: Final crop reduces output size significantly
+
+---
+
+## 6. **Control Flow Architecture**
+```
+INITIALIZATION (SVApp::init):
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. Create MultiCameraSource                                      │
+│ 2. Open 4 V4L2 devices                                           │
+│ 3. Load calibration parameters                                   │
+│ 4. Build undistortion lookup tables (GPU)                        │
+│ 5. Start camera streams                                          │
+│ 6. Create SVStitcher                                             │
+│    ├─ Load camera parameters from files                          │
+│    ├─ Run seam detection on initial frames                       │
+│    ├─ Build multi-band blender pyramids                          │
+│    └─ Compute perspective warp for final crop                    │
+│ 7. Create SVRender & SVDisplayView                               │
+│    ├─ Initialize GLFW window                                     │
+│    ├─ Generate bowl geometry                                     │
+│    ├─ Load car 3D model                                          │
+│    ├─ Compile GLSL shaders                                       │
+│    └─ Create framebuffers                                        │
+│ 8. Initialize background ThreadPool                              │
+└─────────────────────────────────────────────────────────────────┘
+
+RUNTIME LOOP (SVApp::run):
+┌─────────────────────────────────────────────────────────────────┐
+│ loop {                                                            │
+│     ┌─────────────────────────────────────────────────────────┐ │
+│     │ CAPTURE PHASE (~5-10 ms)                                │ │
+│     │ • select() on 4 camera fds                              │ │
+│     │ • VIDIOC_DQBUF all cameras                              │ │
+│     │ • Parallel (OpenMP): YUV→RGB + undistort                │ │
+│     │ • VIDIOC_QBUF return buffers                            │ │
+│     └─────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│     ┌─────────────────────────────────────────────────────────┐ │
+│     │ STITCH PHASE (~30-40 ms)                                │ │
+│     │ • Split rear camera in half                             │ │
+│     │ • Parallel (OpenMP) for 5 images:                       │ │
+│     │   - Resize 0.65×                                        │ │
+│     │   - Spherical warp                                      │ │
+│     │   - Apply gain compensation                             │ │
+│     │   - Convert CV_8U → CV_16S                              │ │
+│     │   - Feed to multi-band blender                          │ │
+│     │ • Collapse Laplacian pyramid                            │ │
+│     │ • Perspective warp + crop                               │ │
+│     └─────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│     ┌─────────────────────────────────────────────────────────┐ │
+│     │ RENDER PHASE (~10-15 ms)                                │ │
+│     │ • CUDA→OpenGL texture transfer (zero-copy)              │ │
+│     │ • Offscreen pass:                                       │ │
+│     │   - Draw bowl with stitched texture                     │ │
+│     │   - Draw ground plane                                   │ │
+│     │   - Draw car model                                      │ │
+│     │ • Screen pass: fullscreen quad                          │ │
+│     │ • glfwSwapBuffers()                                     │ │
+│     └─────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│     ┌─────────────────────────────────────────────────────────┐ │
+│     │ BACKGROUND TASKS (async)                                │ │
+│     │ • Check timers                                          │ │
+│     │ • If 10s elapsed: enqueue recomputeGain()               │ │
+│     │ • If 7s elapsed: enqueue recomputeToneLuminance()       │ │
+│     └─────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│     sleep(3ms);  // ~30 FPS target                               │
+│ }                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+7. Configuration Architecture
+
+struct SVAppConfig {
+    // Camera settings
+    int cam_width = 1280;
+    int cam_height = 720;
+    int calib_width = 1280;
+    int calib_height = 720;
+    
+    // Paths
+    std::string undist_folder = "calibrationData/1280/video";
+    std::string calib_folder = "campar/";
+    std::string car_model = "models/Dodge Challenger.obj";
+    std::string car_vert_shader = "shaders/modelshadervert.glsl";
+    std::string car_frag_shader = "shaders/modelshaderfrag.glsl";
+    
+    // Stitching parameters
+    int numbands = 4;              // Laplacian pyramid levels
+    float scale_factor = 0.65;     // Processing resolution scale
+    
+    // Threading
+    int num_pool_threads = 2;
+    
+    // Timing
+    std::chrono::seconds time_recompute_photometric_gain{10};
+    std::chrono::seconds time_recompute_photometric_luminance{7};
+    
+    // Bowl geometry
+    ConfigBowl cbowl;
+    /*
+        disk_radius = 0.4f;
+        parab_radius = 0.55f;
+        hole_radius = 0.08f;
+        a = 0.4f; b = 0.4f; c = 0.2f;
+        vertices_num = 750.f;
+    */
+    
+    // Feature detection (optional)
+    bool usePedestrianDetection = false;
+};
+```
+
+---
+
+## 8. **Error Handling Architecture**
+```
+INITIALIZATION ERRORS:
+├─ Camera open failure → assert(0), exit
+├─ V4L2 ioctl errors → LOG_ERROR, assert(0)
+├─ CUDA allocation failure → LOG_ERROR, return false
+├─ Calibration file missing → LOG_ERROR, return false
+├─ Seam detection failure → std::cerr, return false
+├─ OpenGL shader compilation → std::cerr, exit(EXIT_FAILURE)
+└─ GLFW window creation → std::cerr, return false
+
+RUNTIME ERRORS:
+├─ Frame capture timeout → LOG_ERROR, continue loop
+├─ Frame drop (select timeout) → Continue, no assert
+├─ CUDA kernel failure → Silent (no explicit checks)
+├─ OpenGL errors → glGetError() (not checked in release)
+└─ Stream sync issues → Potential visual artifacts
+
+RECOVERY STRATEGIES:
+- No automatic recovery - designed for controlled environment
+- Asserts for unrecoverable errors (dev mode)
+- Logging for debugging
+- Continue-on-error for frame drops only
+
+9. Performance Characteristics (continued)
+StageProcessing TimeBottleneckParallelizationCapture5-10 msV4L2 sync, UYVY→RGBOpenMP (4 cameras)UndistortionIncluded in captureMemory bandwidthCUDA streamsResize + Warp8-12 msTexture samplingOpenMP + CUDAGain Compensation1-2 msScalar multiplyCUDA asyncMulti-band Blending15-20 mspyrUp/pyrDownCUDA streamsPerspective Warp2-3 msRemap operationCUDACUDA→OpenGL Transfer1-2 msZero-copy interopDirect mappingOpenGL Rendering8-12 msFragment shaderGPU rasterizationTotal Frame Time~50 ms (20 FPS)Blending pyramidMixed CPU/GPU
+Performance Optimization Techniques:
+
+
+1. CUDA Optimizations:
+   • Zero-copy managed memory (cudaMallocManaged)
+   • Async streams for parallel operations
+   • 32×32 thread blocks for 2D operations
+   • Fast math (-use_fast_math)
+   • Persistent allocations (no per-frame malloc)
+
+2. OpenMP Optimizations:
+   • #pragma omp parallel for on camera loop
+   • #pragma omp parallel for on stitch loop
+   • 2 threads (num_pool_threads = 2)
+
+3. Memory Optimizations:
+   • Pre-allocated pyramid structures
+   • ROI-based final crop (reduces output size)
+   • Step pitch-aware copies (cudaMemcpy2D)
+   • GPU-side color conversions
+
+4. Algorithm Optimizations:
+   • Scale factor 0.65 reduces compute by ~50%
+   • Seam masks computed once at init
+   • Warp maps pre-computed (no per-frame homography)
+   • Gain compensation cached (recompute every 10s)
+```
+
+---
+
+## 10. **Dependency Graph**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      EXTERNAL DEPENDENCIES                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  SYSTEM LIBRARIES:                                               │
+│  • Linux Kernel: V4L2 driver (videodev2.h)                       │
+│  • POSIX: select(), mmap(), ioctl()                              │
+│  • OpenMP: Parallel threading                                    │
+│                                                                   │
+│  NVIDIA LIBRARIES:                                               │
+│  • CUDA 9.0: Runtime, device code                                │
+│    - cuda_runtime.h                                              │
+│    - cuda_gl_interop.h (CUDA-OpenGL bridge)                      │
+│    - nvcc compiler (sm_62 for TX2)                               │
+│                                                                   │
+│  GRAPHICS LIBRARIES:                                             │
+│  • OpenGL ES 3.2: Core rendering                                 │
+│    - GLES3/gl32.h                                                │
+│    - EGL/egl.h (context management)                              │
+│  • GLFW 3.1: Window management                                   │
+│  • GLM: Math library (matrices, vectors)                         │
+│                                                                   │
+│  COMPUTER VISION:                                                │
+│  • OpenCV 4.1.2:                                                 │
+│    - Core: Mat, Size, Point, Rect                                │
+│    - ImgProc: color conversions, morphology                      │
+│    - Calib3D: camera calibration, undistortion                   │
+│    - Stitching: warpers, seam finders, exposure compensators    │
+│    - Features2D: ORB detector                                    │
+│    - CUDA modules:                                               │
+│      • cudaimgproc: color, resize, remap                         │
+│      • cudawarping: warpPerspective, remap                       │
+│      • cudaarithm: add, multiply, subtract                       │
+│      • cudafilters: morphology, pyrUp, pyrDown                   │
+│                                                                   │
+│  3D MODEL LOADING:                                               │
+│  • ASSIMP 4.0.1: .obj model import                               │
+│                                                                   │
+│  BUILD SYSTEM:                                                   │
+│  • CMake 3.16+                                                   │
+│  • C++14 standard                                                │
+│  • CUDA separable compilation                                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Dependency Chain:**
+```
+main() [SVmain.cpp]
+  └─> SVApp [SVApp.cpp]
+       ├─> MultiCameraSource [SVCamera.cpp]
+       │    ├─> V4L2 kernel driver
+       │    ├─> CUDA (yuv2rgb.cu)
+       │    └─> OpenCV (cv::cuda::remap)
+       │
+       ├─> SVStitcher [SVStitcher.cpp]
+       │    ├─> SVAutoCalib [SVAutoCalib.cpp]
+       │    │    └─> OpenCV (ORB, BundleAdjuster)
+       │    ├─> SVSeamDetector [SVSeamDetection.cpp]
+       │    │    └─> OpenCV (SphericalWarper, SeamFinder)
+       │    ├─> SVMultiBandBlender [SVBlender.cpp]
+       │    │    ├─> CUDA (kernelblend.cu)
+       │    │    └─> OpenCV (pyrUp, pyrDown)
+       │    └─> SVGainCompensator [SVGainCompensator.cpp]
+       │
+       ├─> SVRender [SVRender.cpp]
+       │    ├─> Bowl [Bowl.cpp]
+       │    │    └─> meshgrid.hpp
+       │    ├─> Model [Model.cpp]
+       │    │    ├─> ASSIMP
+       │    │    └─> Mesh [Mesh.cpp]
+       │    ├─> Shader [Shader.hpp]
+       │    └─> SVCudaOGL [SVCudaOGL.cpp]
+       │         └─> cuda_gl_interop.h
+       │
+       ├─> SVDisplayView [SVDisplay.cpp]
+       │    └─> GLFW
+       │
+       └─> ThreadPool [ThreadPool.hpp]
+            └─> std::thread, std::future
+```
+
+---
+
+## 11. **File Organization Architecture**
+```
+SurroundView/
+├── CMakeLists.txt                    # Build configuration
+│
+├── include/                          # Header files
+│   ├── SVApp.hpp                     # Main application
+│   ├── SVCamera.hpp                  # Camera capture
+│   ├── SVStitcher.hpp                # Stitching pipeline
+│   ├── SVAutoCalib.hpp               # Auto calibration
+│   ├── SVSeamDetection.hpp           # Seam finding
+│   ├── SVBlender.hpp                 # Multi-band blending
+│   ├── SVGainCompensator.hpp         # Exposure compensation
+│   ├── SVLuminanceBalance.hpp        # Luminance adjustment
+│   ├── SVRender.hpp                  # OpenGL rendering
+│   ├── SVDisplay.hpp                 # Window management
+│   ├── SVCudaOGL.hpp                 # CUDA-OpenGL interop
+│   ├── SVPedestrian.hpp              # HOG pedestrian detection
+│   ├── Bowl.hpp                      # Bowl geometry
+│   ├── Mesh.hpp                      # Mesh structure
+│   ├── Model.hpp                     # 3D model loader
+│   ├── Shader.hpp                    # GLSL shader wrapper
+│   ├── Virtcam.hpp                   # Virtual camera
+│   ├── ThreadPool.hpp                # Thread pool
+│   ├── SVUtil.hpp                    # Utilities
+│   └── meshgrid.hpp                  # Grid generation
+│
+├── src/                              # Implementation files
+│   ├── SVmain.cpp                    # Entry point
+│   ├── SVApp.cpp                     # Application logic
+│   ├── SVCamera.cpp                  # V4L2 implementation
+│   ├── SVStitcher.cpp                # Stitching logic
+│   ├── SVAutoCalib.cpp               # Calibration
+│   ├── SVSeamDetection.cpp           # Seam detection
+│   ├── SVBlender.cpp                 # Blending
+│   ├── SVGainCompensator.cpp         # Gain compensation
+│   ├── SVLuminanceBalance.cpp        # Luminance
+│   ├── SVRender.cpp                  # Rendering
+│   ├── SVDisplay.cpp                 # Display
+│   ├── SVCudaOGL.cpp                 # Interop
+│   ├── SVPedestrian.cpp              # Pedestrian detection
+│   ├── Bowl.cpp                      # Geometry
+│   ├── Mesh.cpp                      # Mesh handling
+│   └── Model.cpp                     # Model loading
+│
+├── cusrc/                            # CUDA kernels
+│   ├── yuv2rgb.cu                    # Color conversion
+│   ├── yuv2rgb.cuh                   # Header
+│   ├── kernelblend.cu                # Blending kernels
+│   ├── util.cu                       # Utilities
+│   └── util.cuh                      # Header
+│
+├── shaders/                          # GLSL shaders
+│   ├── surroundvert.glsl             # Bowl vertex shader
+│   ├── surroundfrag.glsl             # Bowl fragment shader (tone map)
+│   ├── modelshadervert.glsl          # Car vertex shader
+│   ├── modelshaderfrag.glsl          # Car fragment shader
+│   ├── frame_screenvert.glsl         # Quad vertex shader
+│   ├── frame_screenfrag.glsl         # Quad fragment shader
+│   ├── blackrectshadervert.glsl      # Ground vertex shader
+│   └── blackrectshaderfrag.glsl      # Ground fragment shader
+│
+├── calibrationData/                  # Camera calibration
+│   ├── 1280/
+│   │   ├── video0.K                  # Intrinsic matrix
+│   │   ├── video0.dist               # Distortion coefficients
+│   │   ├── video1.K
+│   │   ├── video1.dist
+│   │   ├── video2.K
+│   │   ├── video2.dist
+│   │   ├── video3.K
+│   │   └── video3.dist
+│   └── 1920/                         # Different resolution
+│
+├── camparameters/                    # Stitching parameters
+│   ├── Camparam0.yaml                # Camera 0 extrinsics
+│   ├── Camparam1.yaml
+│   ├── Camparam2.yaml
+│   ├── Camparam3.yaml
+│   ├── Camparam4.yaml                # Rear (split)
+│   └── corner_warppts.yaml           # Perspective warp points
+│
+├── camera_calibration/               # Calibration tools
+│   └── scripts/
+│       ├── calibration.py            # Charuco board calibration
+│       ├── camcalib.py               # Chessboard calibration
+│       ├── capture.py                # Image capture tool
+│       ├── undistcam.py              # Live undistortion test
+│       └── undistort.py              # Offline undistortion
+│
+├── models/                           # 3D models
+│   └── Dodge Challenger SRT Hellcat 2015.obj
+│
+└── 3dparty/                          # Third-party libraries
+    ├── lib/
+    │   ├── libglfw.so.3.1
+    │   ├── libEGL.so
+    │   └── libGLESv2.so
+    └── glm/                          # GLM headers
+```
+
+---
+
+## 12. **State Machine Architecture**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    APPLICATION STATE MACHINE                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│   ┌──────────┐                                                   │
+│   │ STARTING │                                                   │
+│   └────┬─────┘                                                   │
+│        │ SVApp::init()                                           │
+│        ▼                                                          │
+│   ┌──────────────┐                                               │
+│   │ INITIALIZING │                                               │
+│   └────┬─────────┘                                               │
+│        │                                                          │
+│        ├─> Open cameras                                          │
+│        ├─> Load calibration                                      │
+│        ├─> Capture frames (limit_iteration_init times)          │
+│        ├─> Run seam detection                                    │
+│        ├─> Initialize OpenGL                                     │
+│        │                                                          │
+│        │ [Success]                                               │
+│        ▼                                                          │
+│   ┌──────────┐     SVApp::run()                                 │
+│   │  RUNNING │ ◄──────────────────┐                             │
+│   └────┬─────┘                     │                             │
+│        │                            │                             │
+│        ├─> Capture frame            │                             │
+│        ├─> Stitch images            │                             │
+│        ├─> Render 3D view           │                             │
+│        ├─> Check timers             │                             │
+│        │                            │                             │
+│        │ [finish == false]          │                             │
+│        └────────────────────────────┘                             │
+│        │                                                          │
+│        │ [finish == true OR window close]                        │
+│        ▼                                                          │
+│   ┌──────────┐                                                   │
+│   │ SHUTDOWN │                                                   │
+│   └────┬─────┘                                                   │
+│        │                                                          │
+│        ├─> Stop camera streams                                   │
+│        ├─> Release GPU memory                                    │
+│        ├─> Destroy OpenGL context                                │
+│        └─> Exit                                                  │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+DISPLAY VIEW STATES:
+┌──────────────────────────────────────────────────────────────┐
+│  Normal Mode (default)                                        │
+│  ├─ Free camera movement (WASD + mouse)                       │
+│  └─ Manual view control                                       │
+│                                                                │
+│  [Press V]                                                     │
+│  ▼                                                             │
+│  Surround View Demo Mode                                      │
+│  ├─ Auto-rotate camera                                        │
+│  ├─ Camera position: (0, 2.5, 2.75)                           │
+│  └─ Automatic movement                                        │
+│                                                                │
+│  [Press T]                                                     │
+│  ▼                                                             │
+│  Top View Mode                                                │
+│  ├─ Camera position: (0, 4.15, 0)                             │
+│  └─ Looking straight down                                     │
+│                                                                │
+│  [Press R]                                                     │
+│  ▼                                                             │
+│  Reset to Normal Mode                                         │
+│                                                                │
+│  [Press Q or ESC]                                             │
+│  ▼                                                             │
+│  Trigger finish flag → Shutdown                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 13. **CUDA Kernel Architecture**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      CUDA KERNEL CATALOG                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  1. gpuConvertUYVY2RGB_kernel (yuv2rgb.cu)                      │
+│     ┌────────────────────────────────────────────────────────┐  │
+│     │ Thread Block: 16×16                                    │  │
+│     │ Grid: divUp(width/2, 16) × divUp(height, 16)          │  │
+│     │                                                         │  │
+│     │ Per-thread work:                                       │  │
+│     │   • Read 4 bytes (U, Y0, V, Y1) from UYVY buffer      │  │
+│     │   • Convert 2 pixels:                                  │  │
+│     │     - B = Y + 1.770 * (U - 128)                        │  │
+│     │     - G = Y - 0.344 * (U - 128) - 0.714 * (V - 128)   │  │
+│     │     - R = Y + 1.403 * (V - 128)                        │  │
+│     │   • Clamp [0, 255]                                     │  │
+│     │   • Write 6 bytes (BGR, BGR) to output                │  │
+│     └────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  2. feedCUDA_kernel (kernelblend.cu)                             │
+│     ┌────────────────────────────────────────────────────────┐  │
+│     │ Thread Block: 32×32                                    │  │
+│     │ Grid: divUp(width, 32) × divUp(height, 32)            │  │
+│     │                                                         │  │
+│     │ Per-thread work:                                       │  │
+│     │   • Check mask[pixel]                                  │  │
+│     │   • If set:                                            │  │
+│     │     - Copy 6 bytes (CV_16SC3) from src to dst         │  │
+│     │     - dst[pixel+offset] = src[pixel]                  │  │
+│     │     - dst_mask[pixel+offset] |= mask[pixel]           │  │
+│     └────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  3. weightBlendCUDA_kernel (kernelblend.cu)                      │
+│     ┌────────────────────────────────────────────────────────┐  │
+│     │ Thread Block: 32×32                                    │  │
+│     │ Grid: divUp(width, 32) × divUp(height, 32)            │  │
+│     │                                                         │  │
+│     │ Per-thread work:                                       │  │
+│     │   • Read short3 pixel and float weight                │  │
+│     │   • dst[x,y] += src[x,y] * weight                     │  │
+│     │   • dst_weight[x,y] += weight                         │  │
+│     │   • Atomic-free (each thread writes unique location)  │  │
+│     └────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  4. addSrcWeightKernel32F (kernelblend.cu)                       │
+│     ┌────────────────────────────────────────────────────────┐  │
+│     │ Thread Block: 16×16                                    │  │
+│     │ Grid: divUp(width, 16) × divUp(height, 16)            │  │
+│     │                                                         │  │
+│     │ Per-thread work:                                       │  │
+│     │   • Same as weightBlendCUDA but for pyramid level     │  │
+│     │   • Used in multi-band blending inner loop            │  │
+│     └────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  5. normalizeUsingWeightKernel32F (kernelblend.cu)               │
+│     ┌────────────────────────────────────────────────────────┐  │
+│     │ Thread Block: 32×32                                    │  │
+│     │ Grid: divUp(width, 32) × divUp(height, 32)            │  │
+│     │                                                         │  │
+│     │ Per-thread work:                                       │  │
+│     │   • Read accumulated pixel and weight                  │  │
+│     │   • Normalize: pixel[x,y] /= (weight[x,y] + 1e-5)    │  │
+│     │   • Prevents division by zero                         │  │
+│     └────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  CUDA STREAM USAGE:                                              │
+│  • _cudaStream[0..3]: Per-camera YUV conversion                 │
+│  • streamObj: Main stitching operations                         │
+│  • loopStreamObj: Per-image warp operations                     │
+│  • photoStreamObj: Photometric adjustments                      │
+│  • _cudaStreamImage, _cudaStreamMask: Blender sync              │
+│  • _cudaStreamDst, _cudaStreamDst_weight: Blender accumulation  │
+│                                                                   │
+│  KERNEL LAUNCH OVERHEAD MITIGATION:                              │
+│  • Persistent allocations (no cudaMalloc in loop)                │
+│  • Async launches with stream dependencies                       │
+│  • cudaStreamAttachMemAsync for explicit binding                 │
+│  • No explicit cudaDeviceSynchronize() except init               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 14. **OpenGL Rendering Pipeline Detail**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   OPENGL RENDERING PIPELINE                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  PASS 1: OFFSCREEN RENDERING (FBO)                               │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ glBindFramebuffer(GL_FRAMEBUFFER, offscreenFBO);           │ │
+│  │ glClear(COLOR | DEPTH);                                    │ │
+│  │                                                             │ │
+│  │ 1. DRAW SURROUND VIEW BOWL:                                │ │
+│  │    ┌─────────────────────────────────────────────────────┐│ │
+│  │    │ Vertex Shader (surroundvert.glsl):                  ││ │
+│  │    │   in vec3 vPos;        // 3D position              ││ │
+│  │    │   in vec2 vTexCoord;   // UV coordinates           ││ │
+│  │    │   uniform mat4 model, view, projection;            ││ │
+│  │    │                                                      ││ │
+│  │    │   gl_Position = projection * view * model * vec4(); ││ │
+│  │    │   textCoord = vec2(vTexCoord.x, 1.0 - vTexCoord.y);││ │
+│  │    └─────────────────────────────────────────────────────┘│ │
+│  │    ┌─────────────────────────────────────────────────────┐│ │
+│  │    │ Fragment Shader (surroundfrag.glsl):                ││ │
+│  │    │   in vec2 textCoord;                                ││ │
+│  │    │   uniform sampler2D surroundTexture;                ││ │
+│  │    │   uniform float lum_white, lum_map;                 ││ │
+│  │    │                                                      ││ │
+│  │    │   // Seamless 0°/360° blending:                     ││ │
+│  │    │   if (textCoord.x >= 1.0) {                         ││ │
+│  │    │     vec2 wrapCoord = vec2(0.0, textCoord.y);        ││ │
+│  │    │     float alpha = textCoord.x / 1.75;               ││ │
+│  │    │     color = mix(color, texture(..., wrapCoord),     ││ │
+│  │    │                 alpha);                              ││ │
+│  │    │   }                                                  ││ │
+│  │    │                                                      ││ │
+│  │    │   // Reinhard tone mapping:                         ││ │
+│  │    │   float L_old = dot(color, vec3(lum_map));          ││ │
+│  │    │   float L_new = L_old * (1 + L_old / (W²))          ││ │
+│  │    │                 / (1 + L_old);                       ││ │
+│  │    │   color = change_luminance(color, L_new);           ││ │
+│  │    │                                                      ││ │
+│  │    │   // Gamma correction:                              ││ │
+│  │    │   color = pow(color, vec3(1.0 / 2.2));              ││ │
+│  │    └─────────────────────────────────────────────────────┘│ │
+│  │    glBindVertexArray(bowlVAO);                            │ │
+│  │    glDrawElements(GL_TRIANGLE_STRIP, indexCount, ...);   │ │
+│  │                                                             │ │
+│  │ 2. DRAW BLACK GROUND PLANE:                                │ │
+│  │    • Simple rectangle at y=1.0001 (just above bowl base)  │ │
+│  │    • Solid color: (0.2, 0.2, 0.2, 1.0)                    │ │
+│  │    • glDrawArrays(GL_TRIANGLES, 0, 6);                    │ │
+│  │                                                             │ │
+│  │ 3. DRAW 3D CAR MODEL:                                      │ │
+│  │    ┌─────────────────────────────────────────────────────┐│ │
+│  │    │ For each mesh in model:                             ││ │
+│  │    │   • Bind diffuse texture                            ││ │
+│  │    │   • Set material properties (Ka, Kd, Ks, shininess)││ │
+│  │    │   • Transform: translate(0, 1.01, 0)                ││ │
+│  │    │                rotate(-90°, X-axis)                 ││ │
+│  │    │                scale(0.002)                         ││ │
+│  │    │   • glDrawElements(GL_TRIANGLES, ...)               ││ │
+│  │    └─────────────────────────────────────────────────────┘│ │
+│  │                                                             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  PASS 2: SCREEN RENDERING (Default Framebuffer)                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ glBindFramebuffer(GL_FRAMEBUFFER, 0);                      │ │
+│  │ glDisable(GL_DEPTH_TEST);                                  │ │
+│  │                                                             │ │
+│  │ DRAW FULLSCREEN QUAD:                                      │ │
+│  │    ┌─────────────────────────────────────────────────────┐│ │
+│  │    │ Vertex Shader (frame_screenvert.glsl):              ││ │
+│  │    │   in vec3 vPos;       // [-1,1] NDC quad           ││ │
+│  │    │   in vec2 vTexCoord;  // [0,1] UV                  ││ │
+│  │    │   gl_Position = vec4(vPos.xy, 0.0, 1.0);           ││ │
+│  │    └─────────────────────────────────────────────────────┘│ │
+│  │    ┌─────────────────────────────────────────────────────┐│ │
+│  │    │ Fragment Shader (frame_screenfrag.glsl):            ││ │
+│  │    │   in vec2 textCoord;                                ││ │
+│  │    │   uniform sampler2D screenTexture; // FBO color     ││ │
+│  │    │   FragColor = texture(screenTexture, textCoord);    ││ │
+│  │    └─────────────────────────────────────────────────────┘│ │
+│  │    glBindVertexArray(quadVAO);                            │ │
+│  │    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);                │ │
+│  │                                                             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  glfwSwapBuffers(window);  // Present to screen                  │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+
+15. Calibration Data Architecture
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    CALIBRATION DATA STRUCTURE                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  INTRINSIC CALIBRATION (per camera):                             │
+│  File: calibrationData/1280/videoN.K                             │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ fx   0   cx                                                 │ │
+│  │ 0   fy   cy      where fx, fy = focal lengths              │ │
+│  │ 0    0    1            cx, cy = principal point            │ │
+│  │                                                             │ │
+│  │ Example (camera 0):                                         │ │
+│  │ 676.90  0.00  583.60                                        │ │
+│  │ 0.00  678.55  372.87                                        │ │
+│  │ 0.00    0.00    1.00                                        │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  File: calibrationData/1280/videoN.dist                          │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Rational Distortion Model (14 coefficients):                │ │
+│  │                                                             │ │
+│  │ k1, k2, p1, p2, k3, k4, k5, k6,                             │ │
+│  │ 0, 0, 0, 0, 0, 0  (unused parameters)                       │ │
+│  │                                                             │ │
+│  │ Example (camera 0):                                         │ │
+│  │ -4.271129, 3.628747, 0.002033, -0.002202,                  │ │
+│  │  2.853394, -3.916361, 1.947713, 4.944461,                  │ │
+│  │  0, 0, 0, 0, 0, 0                                           │ │
+│  │                                                             │ │
+│  │ Distortion Formula:                                         │ │
+│  │ r² = x² + y²                                                │ │
+│  │ radial = (1 + k1*r² + k2*r⁴ + k3*r⁶) /                     │ │
+│  │          (1 + k4*r² + k5*r⁴ + k6*r⁶)                       │ │
+│  │ x' = x * radial + 2*p1*x*y + p2*(r² + 2*x²)                │ │
+│  │ y' = y * radial + p1*(r² + 2*y²) + 2*p2*x*y                │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  EXTRINSIC CALIBRATION (per camera):                             │
+│  File: camparameters/CamparamN.yaml                              │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ %YAML:1.0                                                   │ │
+│  │ FocalLength: 1076.631347  # Warped image scale             │ │
+│  │                                                             │ │
+│  │ Intrisic: !!opencv-matrix                                  │ │
+│  │   rows: 3                                                   │ │
+│  │   cols: 3                                                   │ │
+│  │   dt: f                                                     │ │
+│  │   data: [969.13, 0, 302.5,                                 │ │
+│  │          0, 969.13, 284,                                   │ │
+│  │          0, 0, 1]                                           │ │
+│  │                                                             │ │
+│  │ Rotation: !!opencv-matrix   # 3x3 rotation from world     │ │
+│  │   rows: 3                                                   │ │
+│  │   cols: 3                                                   │ │
+│  │   dt: f                                                     │ │
+│  │   data: [-0.0144, -0.304, 0.953,                           │ │
+│  │           0.0094, 0.953, 0.304,                            │ │
+│  │          -0.9999, 0.0133, -0.0109]                         │ │
+│  │                                                             │ │
+│  │ Translation: !!opencv-matrix  # 3x1 (unused in this sys)  │ │
+│  │   rows: 3                                                   │ │
+│  │   cols: 1                                                   │ │
+│  │   dt: d                                                     │ │
+│  │   data: [0, 0, 0]                                           │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  PERSPECTIVE WARP POINTS:                                        │
+│  File: camparameters/corner_warppts.yaml                         │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ %YAML:1.0                                                   │ │
+│  │ res_size: [1955, 332]  # Output resolution                 │ │
+│  │ tl: [7, 26]            # Top-left corner                   │ │
+│  │ tr: [1927, 3]          # Top-right corner                  │ │
+│  │ bl: [0, 255]           # Bottom-left corner                │ │
+│  │ br: [1954, 295]        # Bottom-right corner               │ │
+│  │                                                             │ │
+│  │ Purpose: Crop blended panorama to rectangular output       │ │
+│  │          Removes unused/warped edges                        │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  CALIBRATION PROCESS FLOW:                                       │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                                                             │ │
+│  │ 1. INTRINSIC CALIBRATION (per camera, offline):            │ │
+│  │    • Capture images of calibration pattern                 │ │
+│  │      (Charuco board or chessboard)                         │ │
+│  │    • Run: python scripts/calibration.py                    │ │
+│  │    • Detects corners/markers                               │ │
+│  │    • cv::aruco::calibrateCameraCharucoExtended()           │ │
+│  │    • Outputs: videoN.K, videoN.dist                        │ │
+│  │                                                             │ │
+│  │ 2. EXTRINSIC CALIBRATION (multi-camera, auto/manual):      │ │
+│  │    Option A - Automatic (SVAutoCalib):                     │ │
+│  │      • Capture simultaneous frames from all cameras        │ │
+│  │      • Detect ORB features                                 │ │
+│  │      • Match features between overlapping cameras          │ │
+│  │      • Estimate homographies                               │ │
+│  │      • Bundle adjustment                                   │ │
+│  │      • Wave correction (horizontal alignment)              │ │
+│  │      • Save CamparamN.yaml files                           │ │
+│  │                                                             │ │
+│  │    Option B - Manual (existing files):                     │ │
+│  │      • Use pre-calibrated CamparamN.yaml files             │ │
+│  │      • Measured/designed camera positions                  │ │
+│  │                                                             │ │
+│  │ 3. SEAM DETECTION (runtime, first frames):                 │ │
+│  │    • Warp images using extrinsics                          │ │
+│  │    • Apply exposure compensation                           │ │
+│  │    • Run graph-cut seam finder                             │ │
+│  │    • Dilate seam masks                                     │ │
+│  │    • Store for runtime use                                 │ │
+│  │                                                             │ │
+│  │ 4. PERSPECTIVE WARP COMPUTATION (runtime, init):           │ │
+│  │    • Blend all images once                                 │ │
+│  │    • Detect contours of valid region                       │ │
+│  │    • Find corner points (tl, tr, bl, br)                   │ │
+│  │    • Compute perspective transform to rectangle            │ │
+│  │    • Save corner_warppts.yaml                              │ │
+│  │                                                             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 16. **Multi-Band Blending Algorithm Detail**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              MULTI-BAND BLENDING DETAILED ALGORITHM              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  INITIALIZATION (prepare):                                       │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Input: corners[], sizes[], seam_masks[]                    │ │
+│  │ numbands = 4 (default)                                      │ │
+│  │                                                             │ │
+│  │ 1. Compute global bounding rectangle:                      │ │
+│  │    dst_roi = resultRoi(corners, sizes)                     │ │
+│  │    Adjust to be divisible by 2^numbands                    │ │
+│  │                                                             │ │
+│  │ 2. For each image i:                                        │ │
+│  │    • Compute ROI with border (gap = 3 * 2^numbands)       │ │
+│  │    • Ensure divisibility by 2^numbands                     │ │
+│  │    • Store borders: top, left, bottom, right               │ │
+│  │    • Store corners: tl_new, br_new                         │ │
+│  │                                                             │ │
+│  │ 3. Allocate destination pyramids:                          │ │
+│  │    For level 0 to numbands:                                │ │
+│  │      gpu_dst_pyr_laplace_[level] (CV_16SC3)                │ │
+│  │      gpu_dst_band_weights_[level] (CV_32F)                 │ │
+│  │      Size at level L = dst_roi / 2^L                       │ │
+│  │                                                             │ │
+│  │ 4. Build weight pyramids (Gaussian):                       │ │
+│  │    For each image i:                                        │ │
+│  │      • Convert seam_mask to float (0-1)                    │ │
+│  │      • Add borders (copyMakeBorder)                        │ │
+│  │      • Build Gaussian pyramid:                             │ │
+│  │        weight_pyr[0] = bordered_mask                       │ │
+│  │        For level 1 to numbands:                            │ │
+│  │          weight_pyr[level] = pyrDown(weight_pyr[level-1])  │ │
+│  │                                                             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  FEED OPERATION (per frame, per image):                          │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Input: warped_image (CV_16SC3), image_index                │ │
+│  │                                                             │ │
+│  │ 1. Add borders to warped image:                            │ │
+│  │    src_pyr[0] = copyMakeBorder(warped_image,               │ │
+│  │                                top, bottom, left, right)    │ │
+│  │                                                             │ │
+│  │ 2. Build Gaussian pyramid:                                 │ │
+│  │    For level 1 to numbands:                                │ │
+│  │      src_pyr[level] = pyrDown(src_pyr[level-1])            │ │
+│  │                                                             │ │
+│  │ 3. Build Laplacian pyramid:                                │ │
+│  │    For level 0 to numbands-1:                              │ │
+│  │      upsampled = pyrUp(src_pyr[level+1])                   │ │
+│  │      src_laplace[level] = src_pyr[level] - upsampled       │ │
+│  │    src_laplace[numbands] = src_pyr[numbands] (top level)   │ │
+│  │                                                             │ │
+│  │    Pyramid Structure:                                       │ │
+│  │    Level 0: 1280×720 (original resolution × 0.65)          │ │
+│  │    Level 1: 640×360                                         │ │
+│  │    Level 2: 320×180                                         │ │
+│  │    Level 3: 160×90                                          │ │
+│  │    Level 4: 80×45                                           │ │
+│  │                                                             │ │
+│  │ 4. Accumulate weighted Laplacians:                         │ │
+│  │    For level 0 to numbands:                                │ │
+│  │      // Compute position in destination pyramid            │ │
+│  │      x_tl = (corners[i].tl.x - dst_roi.x) >> level         │ │
+│  │      y_tl = (corners[i].tl.y - dst_roi.y) >> level         │ │
+│  │      x_br = (corners[i].br.x - dst_roi.x) >> level         │ │
+│  │      y_br = (corners[i].br.y - dst_roi.y) >> level         │ │
+│  │      rc = Rect(x_tl, y_tl, x_br - x_tl, y_br - y_tl)       │ │
+│  │                                                             │ │
+│  │      // Get ROI in destination                             │ │
+│  │      dst_laplace_roi = gpu_dst_pyr_laplace_[level](rc)     │ │
+│  │      dst_weight_roi = gpu_dst_band_weights_[level](rc)     │ │
+│  │                                                             │ │
+│  │      // Accumulate (CUDA kernel):                          │ │
+│  │      addSrcWeightGpu32F_Async(                             │ │
+│  │        src_laplace[level],                                 │ │
+│  │        weight_pyr[level],                                  │ │
+│  │        dst_laplace_roi,                                    │ │
+│  │        dst_weight_roi                                      │ │
+│  │      )                                                      │ │
+│  │      // Kernel: dst += src * weight                        │ │
+│  │      //         dst_weight += weight                       │ │
+│  │                                                             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  BLEND OPERATION (once per frame, after all feeds):              │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                                                             │ │
+│  │ 1. Normalize all levels:                                   │ │
+│  │    For level 0 to numbands:                                │ │
+│  │      // CUDA kernel:                                       │ │
+│  │      normalizeUsingWeightMapGpu32F_Async(                  │ │
+│  │        dst_band_weights_[level],                           │ │
+│  │        dst_pyr_laplace_[level]                             │ │
+│  │      )                                                      │ │
+│  │      // Kernel: pixel /= (weight + 1e-5)                   │ │
+│  │                                                             │ │
+│  │ 2. Collapse Laplacian pyramid:                             │ │
+│  │    // Start from coarsest level                            │ │
+│  │    For level = numbands down to 1:                         │ │
+│  │      upsampled = pyrUp(dst_pyr_laplace_[level])            │ │
+│  │      dst_pyr_laplace_[level-1] += upsampled                │ │
+│  │                                                             │ │
+│  │    Reconstruction Flow:                                     │ │
+│  │    Level 4 (80×45)                                          │ │
+│  │         ↓ pyrUp                                             │ │
+│  │    Level 3 (160×90) ← add                                   │ │
+│  │         ↓ pyrUp                                             │ │
+│  │    Level 2 (320×180) ← add                                  │ │
+│  │         ↓ pyrUp                                             │ │
+│  │    Level 1 (640×360) ← add                                  │ │
+│  │         ↓ pyrUp                                             │ │
+│  │    Level 0 (1280×720) ← add → Final Result                 │ │
+│  │                                                             │ │
+│  │ 3. Extract valid region and convert:                       │ │
+│  │    result = dst_pyr_laplace_[0](dst_rc_)                   │ │
+│  │    result.convertTo(output, CV_8U)                         │ │
+│  │                                                             │ │
+│  │ 4. Reset pyramids (parallel OpenMP):                       │ │
+│  │    For level 0 to numbands:                                │ │
+│  │      dst_band_weights_[level].setTo(0)                     │ │
+│  │      dst_pyr_laplace_[level].setTo(0)                      │ │
+│  │                                                             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  WHY MULTI-BAND BLENDING?                                        │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ • Low-frequency content (smooth gradients):                │ │
+│  │   Blended at coarse levels (4, 3)                          │ │
+│  │   → Smooth exposure transitions                            │ │
+│  │                                                             │ │
+│  │ • High-frequency content (edges, details):                 │ │
+│  │   Blended at fine levels (0, 1, 2)                         │ │
+│  │   → Preserves sharpness across seams                       │ │
+│  │                                                             │ │
+│  │ • Result: Invisible seams with no ghosting or blur         │ │
+│  │   Better than simple alpha blending or feathering          │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  MEMORY FOOTPRINT (for 5 images, 4 bands):                       │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Destination pyramids:                                       │ │
+│  │   Laplacian: ~8.5 MB (sum of all levels CV_16SC3)         │ │
+│  │   Weights:   ~2.8 MB (sum of all levels CV_32F)           │ │
+│  │                                                             │ │
+│  │ Per-image pyramids (5 images):                             │ │
+│  │   Source Laplacian: 5 × ~1.7 MB = 8.5 MB                  │ │
+│  │   Weight Gaussian:  5 × ~0.6 MB = 3.0 MB                  │ │
+│  │   Upsampling temps: 4 × ~1.0 MB = 4.0 MB                  │ │
+│  │                                                             │ │
+│  │ Total: ~27 MB persistent + ~5 MB temporary                 │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 17. **Camera Layout & Coordinate Systems**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   CAMERA PHYSICAL LAYOUT                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│                          FRONT (Cam 1)                           │
+│                               ↑                                  │
+│                               │                                  │
+│                        ┌──────┴──────┐                           │
+│                        │             │                           │
+│  LEFT (Cam 0)  ←───────┤    CAR      ├────────→  RIGHT (Cam 2)  │
+│                        │             │                           │
+│                        └──────┬──────┘                           │
+│                               │                                  │
+│                               ↓                                  │
+│                         REAR (Cam 3)                             │
+│                                                                   │
+│  Camera Specifications:                                          │
+│  • Model: e-CAM30A CUMI0330 MOD                                  │
+│  • Interface: 2-lane MIPI CSI-2                                  │
+│  • Resolution: 1280×720 @ 30fps (UYVY format)                    │
+│  • Mounting: On tripod around vehicle                            │
+│  • FOV: ~60-90° (standard lens)                                  │
+│                                                                   │
+│  Device Mapping:                                                 │
+│  /dev/video0 → Left camera   (270° azimuth)                      │
+│  /dev/video1 → Front camera  (0° azimuth)                        │
+│  /dev/video2 → Right camera  (90° azimuth)                       │
+│  /dev/video3 → Rear camera   (180° azimuth)                      │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                      COORDINATE SYSTEMS                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  1. CAMERA COORDINATES (per camera):                             │
+│     ┌─────────────────────────────────────────────────────────┐ │
+│     │   Y (up)                                                 │ │
+│     │   │   Z (optical axis, into scene)                      │ │
+│     │   │  ╱                                                   │ │
+│     │   │ ╱                                                    │ │
+│     │   │╱________ X (right)                                  │ │
+│     │   Camera origin                                          │ │
+│     │                                                          │ │
+│     │   Intrinsic matrix K maps 3D → 2D:                      │ │
+│     │   [u]   [fx  0  cx] [X/Z]                               │ │
+│     │   [v] = [0  fy  cy] [Y/Z]                               │ │
+│     │   [1]   [0   0   1] [ 1 ]                               │ │
+│     └─────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  2. WORLD COORDINATES (vehicle-centric):                         │
+│     ┌─────────────────────────────────────────────────────────┐ │
+│     │                Y (up)                                    │ │
+│     │                │                                         │ │
+│     │                │   Front of vehicle                      │ │
+│     │                │  ╱                                      │ │
+│     │                │ ╱ Z (forward)                           │ │
+│     │                │╱                                        │ │
+│     │     ───────────●───────────  X (right)                  │ │
+│     │        Vehicle center (origin)                           │ │
+│     │                                                          │ │
+│     │   Extrinsic transformation:                             │ │
+│     │   X_cam = R * X_world + T                               │ │
+│     │   where R = 3×3 rotation matrix                         │ │
+│     │         T = 3×1 translation vector (unused here)        │ │
+│     └─────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  3. SPHERICAL PROJECTION (warped space):                         │
+│     ┌─────────────────────────────────────────────────────────┐ │
+│     │   Project onto unit sphere:                             │ │
+│     │   θ = atan2(Z, X)  // Azimuth angle                     │ │
+│     │   φ = atan2(Y, √(X²+Z²))  // Elevation angle            │ │
+│     │                                                          │ │
+│     │   Warped coordinates:                                    │ │
+│     │   u = f * θ  // f = focal length (from calibration)    │ │
+│     │   v = f * φ                                             │ │
+│     │                                                          │ │
+│     │   Result: Cylindrical panorama                          │ │
+│     │   360° × vertical FOV                                   │ │
+│     └─────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  4. UV TEXTURE SPACE (bowl/hemisphere):                          │
+│     ┌─────────────────────────────────────────────────────────┐ │
+│     │   Parametric surface (paraboloid):                      │ │
+│     │   x = r * cos(θ)                                        │ │
+│     │   z = r * sin(θ)                                        │ │
+│     │   y = c * (x²/a² + z²/b²)                               │ │
+│     │                                                          │ │
+│     │   UV mapping:                                            │ │
+│     │   u = θ / (2π)        // [0, 1] wraps around           │ │
+│     │   v = r / r_max       // [0, 1] from center to edge    │ │
+│     │                                                          │ │
+│     │   Stitched panorama texture mapped to this surface      │ │
+│     └─────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  5. NDC (Normalized Device Coordinates):                         │
+│     ┌─────────────────────────────────────────────────────────┐ │
+│     │   OpenGL clip space: [-1, 1]³                           │ │
+│     │   After projection matrix:                              │ │
+│     │   gl_Position = projection * view * model * vertex      │ │
+│     │                                                          │ │
+│     │   Viewport transform: NDC → Screen pixels               │ │
+│     │   x_screen = (x_ndc + 1) * width / 2                    │ │
+│     │   y_screen = (y_ndc + 1) * height / 2                   │ │
+│     └─────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  COORDINATE TRANSFORMATION PIPELINE:                             │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                                                             │ │
+│  │  Camera Pixels (1280×720 UYVY)                              │ │
+│  │         ↓ Undistortion (remapX, remapY)                    │ │
+│  │  Undistorted Image                                          │ │
+│  │         ↓ Rotation matrix R                                │ │
+│  │  World Coordinates                                          │ │
+│  │         ↓ Spherical warp (SphericalWarper)                 │ │
+│  │  Warped Panorama                                            │ │
+│  │         ↓ Multi-band blending                              │ │
+│  │  Stitched Panorama (1955×332)                              │ │
+│  │         ↓ Perspective warp (final crop)                    │ │
+│  │  Rectangular Output                                         │ │
+│  │         ↓ Texture mapping to bowl                          │ │
+│  │  3D Bowl Vertices                                           │ │
+│  │         ↓ Model-View-Projection                            │ │
+│  │  Screen Pixels (1280×720 RGB)                              │ │
+│  │                                                             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+
+18. Build System Architecture
+┌─────────────────────────────────────────────────────────────────┐
+│                     CMAKE BUILD CONFIGURATION                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  CMakeLists.txt Structure:                                       │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ cmake_minimum_required(VERSION 3.16)                        │ │
+│  │ project(SurroundView LANGUAGES CXX CUDA)                    │ │
+│  │                                                             │ │
+│  │ # CUDA Configuration                                        │ │
+│  │ find_package(CUDA REQUIRED)                                 │ │
+│  │ set(CMAKE_CUDA_COMPILER /usr/local/cuda-9.0/bin/nvcc)      │ │
+│  │ set(CMAKE_NVCC_FLAGS                                        │ │
+│  │     -Xcompiler -fopenmp      # Enable OpenMP               │ │
+│  │     -use_fast_math            # Fast math operations       │ │
+│  │     -gencode arch=compute_62,code=sm_62  # TX2 arch        │ │
+│  │ )                                                           │ │
+│  │                                                             │ │
+│  │ # C++ Configuration                                         │ │
+│  │ set(CMAKE_CXX_STANDARD 14)                                  │ │
+│  │ find_package(OpenMP REQUIRED)                               │ │
+│  │ set(CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}) │ │
+│  │                                                             │ │
+│  │ # Dependencies                                              │ │
+│  │ find_package(OpenCV REQUIRED)                               │ │
+│  │ find_package(OpenGL REQUIRED)                               │ │
+│  │ find_package(ASSIMP REQUIRED)                               │ │
+│  │                                                             │ │
+│  │ # Custom Libraries (3dparty/)                               │ │
+│  │ set(GLFW_LIB "3dparty/lib/libglfw.so.3.1")                  │ │
+│  │ set(GLES_LIB "3dparty/lib/libEGL.so")                       │ │
+│  │ list(APPEND GLES_LIB "3dparty/lib/libGLESv2.so")            │ │
+│  │ set(GLM_INCLUDE_DIR "3dparty/glm")                          │ │
+│  │                                                             │ │
+│  │ # Source Files                                              │ │
+│  │ file(GLOB SOURCE_FILES                                      │ │
+│  │      ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp                  │ │
+│  │      ${CMAKE_CURRENT_SOURCE_DIR}/cusrc
+
+│  │      ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp                  │ │
+│  │      ${CMAKE_CURRENT_SOURCE_DIR}/cusrc/*.cu                 │ │
+│  │ )                                                           │ │
+│  │                                                             │ │
+│  │ # Executable                                                │ │
+│  │ add_executable(SurroundView ${SOURCE_FILES})               │ │
+│  │                                                             │ │
+│  │ # CUDA Properties                                           │ │
+│  │ set_target_properties(SurroundView PROPERTIES              │ │
+│  │     CUDA_SEPARABLE_COMPILATION ON  # Link .cu separately   │ │
+│  │     CUDA_STANDARD 14                                       │ │
+│  │ )                                                           │ │
+│  │                                                             │ │
+│  │ # Link Libraries                                            │ │
+│  │ target_link_libraries(SurroundView PUBLIC                  │ │
+│  │     ${OpenCV_LIBS}                                          │ │
+│  │     ${CUDA_LIBRARIES}                                       │ │
+│  │     ${GLFW_LIB}                                             │ │
+│  │     ${GLES_LIB}                                             │ │
+│  │     ${ASSIMP_LIBRARIES}                                     │ │
+│  │ )                                                           │ │
+│  │                                                             │ │
+│  │ # Include Directories                                       │ │
+│  │ target_include_directories(SurroundView PUBLIC              │ │
+│  │     ${PROJECT_SOURCE_DIR}/include                          │ │
+│  │     ${OpenCV_INCLUDE_DIRS}                                  │ │
+│  │     ${CUDA_INCLUDE_DIRS}                                    │ │
+│  │     ${OPENGL_EGL_INCLUDE_DIR}                               │ │
+│  │     ${GLM_INCLUDE_DIR}                                      │ │
+│  │     ${3DP_INCLUDE_DIR}                                      │ │
+│  │     ${ASSIMP_INCLUDE_DIRS}                                  │ │
+│  │ )                                                           │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  BUILD COMMANDS:                                                 │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ # Create build directory                                    │ │
+│  │ mkdir build && cd build                                     │ │
+│  │                                                             │ │
+│  │ # Configure (Debug)                                         │ │
+│  │ cmake -DCMAKE_BUILD_TYPE=Debug \                            │ │
+│  │       -DCMAKE_CUDA_FLAGS="-arch=sm_62" \                    │ │
+│  │       ../                                                   │ │
+│  │                                                             │ │
+│  │ # Configure (Release)                                       │ │
+│  │ cmake -DCMAKE_BUILD_TYPE=Release \                          │ │
+│  │       -DCMAKE_CUDA_FLAGS="-arch=sm_62" \                    │ │
+│  │       ../                                                   │ │
+│  │                                                             │ │
+│  │ # Build                                                     │ │
+│  │ make -j4                                                    │ │
+│  │                                                             │ │
+│  │ # Run                                                       │ │
+│  │ ./SurroundView                                              │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  CUSTOM OPENCV BUILD (opencvmake.txt):                           │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ cmake -DCMAKE_BUILD_TYPE=Release \                          │ │
+│  │       -DCMAKE_INSTALL_PREFIX=/usr/local \                   │ │
+│  │       -DOPENCV_EXTRA_MODULES_PATH=~/opencv_contrib/modules \│ │
+│  │       -DWITH_CUDA=ON \                                      │ │
+│  │       -DCUDA_FAST_MATH=ON \                                 │ │
+│  │       -DWITH_CUBLAS=ON \                                    │ │
+│  │       -DWITH_CUFFT=ON \                                     │ │
+│  │       -DOPENCV_DNN_CUDA=ON \                                │ │
+│  │       -DWITH_V4L2=ON \                                      │ │
+│  │       -DWITH_V4L=ON \                                       │ │
+│  │       -DWITH_GSTREAMER=ON \                                 │ │
+│  │       -DCUDA_ARCH_BIT=6.2 \           # SM 6.2 for TX2     │ │
+│  │       -DCUDA_ARCH_PTX="" \                                  │ │
+│  │       -DENABLE_NEON=ON \               # ARM NEON SIMD     │ │
+│  │       -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-9.0 \         │ │
+│  │       ..                                                    │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  COMPILATION UNITS:                                              │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ C++ Files (compiled with g++):                              │ │
+│  │ • src/SVmain.cpp                                            │ │
+│  │ • src/SVApp.cpp                                             │ │
+│  │ • src/SVCamera.cpp                                          │ │
+│  │ • src/SVStitcher.cpp                                        │ │
+│  │ • ... (all .cpp files)                                      │ │
+│  │                                                             │ │
+│  │ CUDA Files (compiled with nvcc):                            │ │
+│  │ • cusrc/yuv2rgb.cu                                          │ │
+│  │ • cusrc/kernelblend.cu                                      │ │
+│  │ • cusrc/util.cu                                             │ │
+│  │                                                             │ │
+│  │ Link Order:                                                 │ │
+│  │ 1. All .o files from .cpp                                   │ │
+│  │ 2. All .o files from .cu (device code)                     │ │
+│  │ 3. Static libraries (OpenCV, ASSIMP)                        │ │
+│  │ 4. Shared libraries (CUDA, OpenGL, GLFW)                    │ │
+│  │                                                             │ │
+│  │ Output: SurroundView executable (~15 MB)                    │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 19. **Error Recovery & Edge Cases**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  ERROR HANDLING & EDGE CASES                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  CAMERA CAPTURE ERRORS:                                          │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ 1. Camera Not Found:                                        │ │
+│  │    • open("/dev/videoN") returns -1                         │ │
+│  │    • LOG_ERROR, assert(0)                                   │ │
+│  │    • No recovery - requires hardware fix                    │ │
+│  │                                                             │ │
+│  │ 2. Frame Timeout:                                           │ │
+│  │    • select() returns 0 (no data within 1 second)          │ │
+│  │    • LOG_ERROR("select() timed out...")                     │ │
+│  │    • Return false, continue loop                            │ │
+│  │    • Effect: Dropped frame, ~20ms delay                     │ │
+│  │                                                             │ │
+│  │ 3. Unsynchronized Cameras:                                  │ │
+│  │    • FD_ISSET() false for one camera                        │ │
+│  │    • LOG_DEBUG("Not all cameras ready")                     │ │
+│  │    • Return false, retry next iteration                     │ │
+│  │    • Root cause: Hardware sync issue                        │ │
+│  │                                                             │ │
+│  │ 4. Buffer Corruption:                                       │ │
+│  │    • buff.index out of range                                │ │
+│  │    • LOG_ERROR, assert(0)                                   │ │
+│  │    • No recovery - driver bug                               │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  STITCHING ERRORS:                                               │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ 1. Calibration Load Failure:                                │ │
+│  │    • Files videoN.K or videoN.dist not found               │ │
+│  │    • LOG_ERROR, return false                                │ │
+│  │    • App exits from init()                                  │ │
+│  │                                                             │ │
+│  │ 2. Insufficient Feature Matches:                            │ │
+│  │    • pairwise_matches.size() < imgs_num * imgs_num         │ │
+│  │    • std::cerr("Error not enough calibrates images")        │ │
+│  │    • Return false from SVAutoCalib                          │ │
+│  │    • Mitigation: Ensure overlapping FOV                     │ │
+│  │                                                             │ │
+│  │ 3. Seam Detection Failure:                                  │ │
+│  │    • Mask size out of bounds                                │ │
+│  │    • std::cerr("Error: fail build masks for seam")          │ │
+│  │    • Return false                                           │ │
+│  │    • Cause: Bad camera parameters                           │ │
+│  │                                                             │ │
+│  │ 4. Gain Compensation Overflow:                              │ │
+│  │    • gain > 10.0 (extreme lighting difference)              │ │
+│  │    • No explicit check - clamps at multiply                 │ │
+│  │    • Effect: Overexposed or clipped output                  │ │
+│  │    • Mitigation: Recompute every 10 seconds                 │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  RENDERING ERRORS:                                               │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ 1. Shader Compilation Failure:                              │ │
+│  │    • glGetShaderiv(GL_COMPILE_STATUS) returns false        │ │
+│  │    • std::cerr with shader log                              │ │
+│  │    • exit(EXIT_FAILURE)                                     │ │
+│  │    • No recovery - fix shader code                          │ │
+│  │                                                             │ │
+│  │ 2. Model Load Failure:                                      │ │
+│  │    • ASSIMP returns nullptr                                 │ │
+│  │    • std::cerr("Error Assimp: ...")                         │ │
+│  │    • exit(EXIT_FAILURE)                                     │ │
+│  │    • Cause: Missing .obj file                               │ │
+│  │                                                             │ │
+│  │ 3. CUDA-OpenGL Interop Failure:                             │ │
+│  │    • cudaGraphicsGLRegisterBuffer() != cudaSuccess         │ │
+│  │    • Return false from init()                               │ │
+│  │    • No rendering, black screen                             │ │
+│  │    • Cause: Driver incompatibility                          │ │
+│  │                                                             │ │
+│  │ 4. Framebuffer Incomplete:                                  │ │
+│  │    • glCheckFramebufferStatus() != GL_FRAMEBUFFER_COMPLETE │ │
+│  │    • Return false from initQuadRender()                     │ │
+│  │    • Effect: No offscreen rendering                         │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  MEMORY ERRORS:                                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ 1. CUDA Out of Memory:                                      │ │
+│  │    • cudaMalloc() returns cudaErrorMemoryAllocation        │ │
+│  │    • Silent failure (no explicit check)                     │ │
+│  │    • Effect: Segfault or garbage output                     │ │
+│  │    • Mitigation: TX2 has fixed 8GB shared memory            │ │
+│  │                                                             │ │
+│  │ 2. OpenCV Allocation Failure:                               │ │
+│  │    • cv::cuda::GpuMat throws cv::Exception                  │ │
+│  │    • Uncaught - program crashes                             │ │
+│  │    • Rare: Most allocations are persistent                  │ │
+│  │                                                             │ │
+│  │ 3. V4L2 mmap Failure:                                       │ │
+│  │    • mmap() returns MAP_FAILED                              │ │
+│  │    • LOG_ERROR, assert(0)                                   │ │
+│  │    • No recovery - driver issue                             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  EDGE CASES:                                                     │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ 1. Extreme Lighting Changes:                                │ │
+│  │    • One camera in direct sunlight, others in shadow        │ │
+│  │    • Gain compensation helps but limited                    │ │
+│  │    • May see visible seam or exposure mismatch              │ │
+│  │    • Recomputes gain every 10s to adapt                     │ │
+│  │                                                             │ │
+│  │ 2. Fast-Moving Objects:                                     │ │
+│  │    • Objects appear in multiple cameras simultaneously      │ │
+│  │    • Timestamps not perfectly aligned (~1-5ms diff)         │ │
+│  │    • Effect: Ghosting/doubling at seams                     │ │
+│  │    • Mitigation: Hardware trigger (not implemented)         │ │
+│  │                                                             │ │
+│  │ 3. Camera Obstruction:                                      │ │
+│  │    • One camera temporarily blocked                         │ │
+│  │    • Black region in stitched output                        │ │
+│  │    • No automatic detection/compensation                    │ │
+│  │                                                             │ │
+│  │ 4. Overheating (Jetson TX2):                                │ │
+│  │    • GPU throttles at ~80°C                                 │ │
+│  │    • FPS drops from 20 to ~10-15                            │ │
+│  │    • No software mitigation                                 │ │
+│  │    • Recommendation: Add heatsink/fan                       │ │
+│  │                                                             │ │
+│  │ 5. Seam Misalignment:                                       │ │
+│  │    • Vibration changes camera orientation                   │ │
+│  │    • Seams computed at init become invalid                  │ │
+│  │    • Visible stitching artifacts                            │ │
+│  │    • Recovery: Restart application                          │ │
+│  │                                                             │ │
+│  │ 6. 0°/360° Boundary Blending:                               │ │
+│  │    • Rear camera split creates artificial seam              │ │
+│  │    • Fragment shader blends with alpha = textCoord.x/1.75   │ │
+│  │    • Works well if rear camera centered                     │ │
+│  │    • Breaks if rear slightly rotated                        │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 20. **Performance Profiling & Bottlenecks**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    PERFORMANCE PROFILING                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  TYPICAL FRAME BREAKDOWN (1280×720, 4 cameras, scale=0.65):     │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                                                             │ │
+│  │  Stage                          Time (ms)    % of Frame    │ │
+│  │  ────────────────────────────────────────────────────────  │ │
+│  │  1. V4L2 select() + DQBUF         5-8         10-16%       │ │
+│  │  2. CUDA YUV→RGB (4 cameras)      2-3          4-6%        │ │
+│  │  3. Undistortion remap (4 cam)    3-4          6-8%        │ │
+│  │  4. Rear camera split             0.5          1%          │ │
+│  │  5. Parallel resize (5 images)    2-3          4-6%        │ │
+│  │  6. Spherical warp (5 images)     6-8         12-16%       │ │
+│  │  7. Gain compensation             1-2          2-4%        │ │
+│  │  8. CV_8U → CV_16S conversion     1            2%          │ │
+│  │  9. Multi-band feed (5 images)                             │ │
+│  │     - Build Laplacian pyramids    8-10        16-20%       │ │
+│  │     - Accumulate weighted         3-4          6-8%        │ │
+│  │  10. Multi-band blend                                      │ │
+│  │     - Normalize pyramids          1-2          2-4%        │ │
+│  │     - Collapse Laplacian          4-6          8-12%       │ │
+│  │  11. Perspective warp + crop      2-3          4-6%        │ │
+│  │  12. CUDA→OpenGL texture xfer     1-2          2-4%        │ │
+│  │  13. OpenGL rendering                                      │ │
+│  │     - Draw bowl                   4-6          8-12%       │ │
+│  │     - Draw car model              2-4          4-8%        │ │
+│  │     - Draw screen quad            1            2%          │ │
+│  │  14. glfwSwapBuffers             1-2          2-4%        │ │
+│  │  ────────────────────────────────────────────────────────  │ │
+│  │  TOTAL                           48-65 ms    15-20 FPS     │ │
+│  │                                                             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  PRIMARY BOTTLENECKS (ranked):                                   │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ 1. Multi-Band Blending (16-26% of frame time)              │ │
+│  │    Cause: 5 pyramid builds + collapse per frame            │ │
+│  │    - pyrDown: 5 levels × 5 images = 25 operations          │ │
+│  │    - pyrUp: 4 levels = 4 operations                        │ │
+│  │    - Each involves Gaussian blur + downsample/upsample     │ │
+│  │    Optimization potential: Medium                           │ │
+│  │    - Use smaller numbands (3 instead of 4): +3 FPS         │ │
+│  │    - Use feather blending instead: +5 FPS (lower quality)  │ │
+│  │                                                             │ │
+│  │ 2. Spherical Warping (12-16% of frame time)                │ │
+│  │    Cause: Texture sampling from lookup tables               │ │
+│  │    - 5 images × cv::cuda::remap                            │ │
+│  │    - Linear interpolation for each pixel                   │ │
+│  │    Optimization potential: Low                              │ │
+│  │    - Already using GPU                                      │ │
+│  │    - Could use lower interpolation quality: +1 FPS         │ │
+│  │                                                             │ │
+│  │ 3. V4L2 Camera Sync (10-16% of frame time)                 │ │
+│  │    Cause: Hardware synchronization latency                  │ │
+│  │    - Waiting for all 4 cameras to be ready                 │ │
+│  │    - Limited by slowest camera                             │ │
+│  │    Optimization potential: None (hardware limited)          │ │
+│  │                                                             │ │
+│  │ 4. OpenGL Rendering (14-22% of frame time)                 │ │
+│  │    Cause: Fragment shader complexity + overdraw             │ │
+│  │    - Tone mapping shader: 3 texture lookups + math         │ │
+│  │    - Car model: ~50K triangles                             │ │
+│  │    Optimization potential: Medium                           │ │
+│  │    - Simplify car model: +2 FPS                            │ │
+│  │    - Simplify tone mapping: +1 FPS                         │ │
+│  │                                                             │ │
+│  │ 5. Memory Bandwidth (underlying all operations)            │ │
+│  │    TX2 memory bandwidth: ~58.4 GB/s shared                 │ │
+│  │    Estimated usage per frame:                              │ │
+│  │    - Camera capture: 4 × 1280×720×2 = 7.4 MB              │ │
+│  │    - Undistortion: 4 × 1280×720×3 × 2 = 22.1 MB           │ │
+│  │    - Stitching: ~50 MB (multiple reads/writes)            │ │
+│  │    - Rendering: ~10 MB                                     │ │
+│  │    Total: ~90 MB/frame @ 20 FPS = 1.8 GB/s (3% of BW)     │ │
+│  │    Optimization potential: Low (not BW limited)             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  OPTIMIZATION OPPORTUNITIES:                                     │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Easy wins:                                                  │ │
+│  │ • Reduce numbands: 4→3 saves ~3-5 ms (+3 FPS)              │ │
+│  │ • Lower scale_factor: 0.65→0.5 saves ~10 ms (+5 FPS)       │ │
+│  │ • Disable car model saves ~3 ms (+2 FPS)                    │ │
+│  │ • Use feather blend saves ~8 ms (+5 FPS, quality loss)     │ │
+│  │                                                             │ │
+│  │ Moderate effort:                                            │ │
+│  │ • CUDA kernel fusion (combine warp+gain) saves ~2 ms       │ │
+│  │ • Optimize pyramid collapse (in-place ops) saves ~2 ms     │ │
+│  │ • Async CUDA streams (hide latency) saves ~3 ms            │ │
+│  │                                                             │ │
+│  │ Hard/risky:                                                 │ │
+│  │ • Custom blending algorithm saves ~5 ms (quality risk)     │ │
+│  │ • Hardware-triggered cameras saves ~5 ms (hardware mod)    │ │
+│  │ • INT8 processing (lose precision) saves ~8 ms             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  GPU UTILIZATION (nvidia-smi on TX2):                            │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ GPU: 70-85% utilization                                     │ │
+│  │ Memory: 3.2 / 8.0 GB used                                   │ │
+│  │ Frequency: 1.3 GHz (max, no throttling)                     │ │
+│  │ Temperature: 65-75°C (safe range)                           │ │
+│  │                                                             │ │
+│  │ CPU: 30-40% utilization (2 cores active with OpenMP)        │ │
+│  │ - Mostly idle during GPU operations                         │ │
+│  │ - Active during OpenCV CPU functions (seam detection)       │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+
+
+Summary: Complete Architecture Overview
+This 3D Surround View system represents a highly optimized, real-time computer vision pipeline that:
+
+Captures 4 synchronized camera streams via V4L2
+Undistorts using pre-calibrated lens parameters
+Warps to spherical projection for seamless overlap
+Blends using multi-band Laplacian pyramids for invisible seams
+Projects onto 3D geometry (paraboloid bowl)
+Renders with OpenGL ES including tone mapping
+Displays at 15-20 FPS with 3D car model overlay
+
+Key Architectural Strengths:
+
+GPU-accelerated throughout (CUDA + OpenGL)
+Zero-copy memory sharing (CUDA ↔ OpenGL)
+Persistent allocations (minimal per-frame malloc)
+Multi-threaded (OpenMP for parallelism)
+Modular design (easy to extend/modify)
+
+Primary Limitation:
+
+Hardware-bound at ~20 FPS due to multi-band blending complexity
+
+This architecture serves as an excellent foundation for adapting to Ethernet fisheye cameras - the core algorithms remain valid, requiring mainly input layer modifications for network streaming and fisheye-specific calibration models.RetryClaude can make mistakes. Please double-check responses. Sonnet 4.5
+
+
+
+//=================AUTO CALIBRATION ARCHITECTURE  :=============================
+
+main.cpp
+  └─> SVApp::init()
+        └─> SVStitcher::init()  ← When auto-calibration is enabled
+              └─> SVAutoCalib::calibrate()  ← The main entry point
+                    ├─> computeImageFeaturesAndMatches_()
+                    │     ├─> cv::ORB::create()  [OpenCV]
+                    │     ├─> cv::detail::computeImageFeatures()  [OpenCV]
+                    │     └─> cv::detail::BestOf2NearestMatcher()  [OpenCV]
+                    │
+                    ├─> cv::detail::leaveBiggestComponent()  [OpenCV]
+                    │
+                    ├─> computeCameraParameters()
+                    │     ├─> cv::detail::HomographyBasedEstimator()  [OpenCV]
+                    │     ├─> cv::detail::BundleAdjusterRay()  [OpenCV]
+                    │     └─> cv::detail::waveCorrect()  [OpenCV]
+                    │
+                    └─> saveData()
+                          └─> cv::FileStorage::write()  [OpenCV]
+                          
+//===========================STITCHING VISUAL REPRESENTATION :=====================
+### Visual Representation
+```
+Top View of Car with Cameras:
+
+        [Front Camera]
+             |
+    Left ----+---- Right
+    Camera   |    Camera
+             |
+        [Rear Camera]
+             ↓
+        Split into:
+    [Left Half] [Right Half]
+    
+    
+    2. WORLD COORDINATES (vehicle-centric):                         │
+│     ┌─────────────────────────────────────────────────────────┐ │
+│     │                Y (up)                                    │ │
+│     │                │                                         │ │
+│     │                │   Front of vehicle                      │ │
+│     │                │  ╱                                      │ │
+│     │                │ ╱ Z (forward)                           │ │
+│     │                │╱                                        │ │
+│     │     ───────────●───────────  X (right)                  │ │
+│     │        Vehicle center (origin)                           │ │
+│     │                                                          │ │
+│     │   Extrinsic transformation:                             │ │
+│     │   X_cam = R * X_world + T                               │ │
+│     │   where R = 3×3 rotation matrix                         │ │
+│     │         T = 3×1 translation vector (unused here)        │ │
+│     └─────────────────────────────────────────────────────────┘ │
+
+Rotation: !!opencv-matrix
+   data: [ r11, r12, r13,    ← Row 1: X-components
+           r21, r22, r23,    ← Row 2: Y-components  
+           r31, r32, r33 ]   ← Row 3: Z-components
+           
+           ↑    ↑    ↑
+         Col1  Col2  Col3
+         
+Column 3 = [r13, r23, r33] = Camera viewing direction vector
+
+YOUR OUTPUT IS CORRECT:
+
+Camera 0: Rear Left half
+Camera 1: Front
+Camera 2: Right
+Camera 3: Rear Right half
+Camera 4: Left
