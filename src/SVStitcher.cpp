@@ -25,12 +25,12 @@ bool SVStitcher::init(const std::vector<cv::cuda::GpuMat>& imgs){
 	    std::cerr << "Error pass images - size must be greater 2...\n";
 	    return false;
 	}
-
 	std::vector<cv::cuda::GpuMat> imgs_ = imgs;
 
-	// splitRearView(imgs_);
+	splitRearView(imgs_);
 
 	imgs_num = imgs_.size();
+    std::cout << "=============number of images============== 0" << imgs_num << std::endl;
 
 	std::vector<cv::Mat> cpu_imgs(imgs_num);
 	for (size_t i = 0; i < imgs_num; ++i){
@@ -112,10 +112,11 @@ bool SVStitcher::initFromFile(const std::string& dirpath, const std::vector<cv::
         std::cerr << "Error pass images - size must be greater 2...\n";
         return false;
     }
+    std::cout << "=============number of images============== 1" << imgs.size() << std::endl;
 
     std::vector<cv::cuda::GpuMat> imgs_ = imgs;
 
-    // splitRearView(imgs_);
+    splitRearView(imgs_);
 
     imgs_num = imgs_.size();
 
@@ -183,6 +184,7 @@ bool SVStitcher::getDataFromFile(const std::string& dirpath, std::vector<cv::Mat
     Ks_f = std::move(std::vector<cv::Mat>(imgs_num));
     R = std::move(std::vector<cv::Mat>(imgs_num));
     auto fullpath = dirpath + "Camparam";
+    std::cout << "=============number of images============== 2" << imgs_num << std::endl;
     for(auto i = 0; i < imgs_num; ++i){
            std::string KRpath{fullpath + std::to_string(i) + ".yaml"};
            cv::FileStorage KRfout(KRpath, cv::FileStorage::READ);

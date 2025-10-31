@@ -279,15 +279,15 @@ bool EthernetCameraSource::capture(cv::cuda::GpuMat& frame, size_t timeout) {
 
 MultiCameraSource::MultiCameraSource()
     : _cams({
-          //EthernetCameraSource("192.168.45.10", 5020, "192.168.45.3", "Front"),
-          //EthernetCameraSource("192.168.45.11", 5021, "192.168.45.3", "Right"),
-          //EthernetCameraSource("192.168.45.12", 5022, "192.168.45.3", "Rear"),
-          //EthernetCameraSource("192.168.45.13", 5023, "192.168.45.3", "Left")
+          EthernetCameraSource("192.168.45.10", 5020, "192.168.45.3", "Front"),
+          EthernetCameraSource("192.168.45.11", 5021, "192.168.45.3", "Left"),
+          EthernetCameraSource("192.168.45.12", 5022, "192.168.45.3", "Rear"),
+          EthernetCameraSource("192.168.45.13", 5023, "192.168.45.3", "Right")
           
-          EthernetCameraSource("192.168.45.11", 5021, "192.168.45.3", "Right"),   // Index 0 ✅
-          EthernetCameraSource("192.168.45.12", 5022, "192.168.45.3", "Front"),  // Index 1 ✅
-          EthernetCameraSource("192.168.45.13", 5023, "192.168.45.3", "Right"),   // Index 2 ✅ 
-          EthernetCameraSource("192.168.45.10", 5020, "192.168.45.3", "Rear")    // Index 3 ✅ MUST BE LAST!
+        //   EthernetCameraSource("192.168.45.11", 5021, "192.168.45.3", "Right"),   // Index 0 ✅
+        //   EthernetCameraSource("192.168.45.12", 5022, "192.168.45.3", "Front"),  // Index 1 ✅
+        //   EthernetCameraSource("192.168.45.13", 5023, "192.168.45.3", "Left"),   // Index 2 ✅ 
+        //   EthernetCameraSource("192.168.45.10", 5020, "192.168.45.3", "Rear")    // Index 3 ✅ MUST BE LAST!
 
 
           

@@ -1,4 +1,5 @@
 #include <SVApp.hpp>
+#include <opencv2/cudawarping.hpp>
 
 #include <csignal>
 
@@ -116,19 +117,41 @@ bool SVApp::init(const int limit_iteration_init_)
                         continue;
                 }
 
-                // std::vector<cv::cuda::GpuMat> datas {cv::cuda::GpuMat(), frames[0].gpuFrame, frames[1].gpuFrame, frames[2].gpuFrame, frames[3].gpuFrame};
+                std::vector<cv::cuda::GpuMat> datas {cv::cuda::GpuMat(), frames[0].gpuFrame, frames[1].gpuFrame, frames[2].gpuFrame, frames[3].gpuFrame};
 
-                std::vector<cv::cuda::GpuMat> datas { frames[0].gpuFrame, frames[1].gpuFrame, frames[2].gpuFrame, frames[3].gpuFrame};
-                //init = svtitch->init(datas); // this part include autocalibration with features detection
+                // std::vector<cv::cuda::GpuMat> datas { frames[0].gpuFrame, frames[1].gpuFrame, frames[2].gpuFrame, frames[3].gpuFrame};
+      
+                // // =========using downscaled data for autocalibration====================
+                std::vector<cv::cuda::GpuMat> datas_downscaled;
+                datas_downscaled.push_back(cv::cuda::GpuMat()); // Empty placeholder at index 0
 
-		//Debug After capturing frames, before calling svtitch->initFromFile
-		// for (size_t i = 0; i < frames.size(); ++i) {
-		//     cv::Mat cpu_frame;
-		//     frames[i].gpuFrame.download(cpu_frame);
-		//     cv::imwrite("debug_camera_" + std::to_string(i) + ".jpg", cpu_frame);
-		//     std::cout << "Saved debug_camera_" << i << ".jpg" << std::endl;
-            // }
-               init = svtitch->initFromFile(svappcfg.calib_folder, datas, false);
+                // Loop through frames array directly (NOT datas) to skip empty placeholder
+                for (int i = 0; i < 4; i++) {
+                    if (frames[i].gpuFrame.empty()) {
+                        std::cerr << "ERROR: Frame " << i << " is empty!" << std::endl;
+                        continue;
+                    }
+                    cv::cuda::GpuMat resized;
+                    cv::cuda::resize(frames[i].gpuFrame, resized, cv::Size(), 0.5, 0.5, cv::INTER_LINEAR);
+                    datas_downscaled.push_back(resized);
+                }
+
+                std::cout << "datas_downscaled size: " << datas_downscaled.size() << std::endl;
+
+                /*CHANGE THIS LINE: Use downscaled images for init*/
+                init = svtitch->init(datas_downscaled); // Use downscaled version for calibration
+                //==========================End of downscaling==================
+
+                // init = svtitch->init(datas); // this part include autocalibration with features detection
+
+                // Debug After capturing frames, before calling svtitch->initFromFile
+                // for (size_t i = 0; i < frames.size(); ++i) {
+                //     cv::Mat cpu_frame;
+                //     frames[i].gpuFrame.download(cpu_frame);
+                //     cv::imwrite("debug_camera_" + std::to_string(i) + ".jpg", cpu_frame);
+                //     std::cout << "Saved debug_camera_" << i << ".jpg" << std::endl;
+                    // }
+            //    init = svtitch->initFromFile(svappcfg.calib_folder, datas, false);
 #ifdef GL_USE
                 if (init){
                     addBowlConfig(svappcfg.cbowl);

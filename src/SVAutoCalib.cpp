@@ -100,11 +100,11 @@ bool SVAutoCalib::computeImageFeaturesAndMatches_(
         std::cout << "Camera " << i << ": " << features[i].keypoints.size() 
                   << " features detected" << std::endl;
         
-        // Save debug image (optional - comment out if not needed)
-        cv::Mat debug_img;
-        cv::drawKeypoints(imgs[i], features[i].keypoints, debug_img, 
-                         cv::Scalar::all(-1), cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
-        cv::imwrite("debug_features_cam" + std::to_string(i) + ".jpg", debug_img);
+        // ================================Save debug image (optional - comment out if not needed)
+        // cv::Mat debug_img;
+        // cv::drawKeypoints(imgs[i], features[i].keypoints, debug_img, 
+        //                  cv::Scalar::all(-1), cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
+        // cv::imwrite("debug_features_cam" + std::to_string(i) + ".jpg", debug_img);
     }
     
     // Match features
@@ -120,13 +120,13 @@ bool SVAutoCalib::computeImageFeaturesAndMatches_(
                       << m.confidence << std::endl;
             total_good_matches++;
             
-            // Save match visualization (optional)
-            cv::Mat match_img;
-            cv::drawMatches(imgs[m.src_img_idx], features[m.src_img_idx].keypoints,
-                           imgs[m.dst_img_idx], features[m.dst_img_idx].keypoints,
-                           m.matches, match_img);
-            cv::imwrite("debug_matches_" + std::to_string(m.src_img_idx) + "_" + 
-                        std::to_string(m.dst_img_idx) + ".jpg", match_img);
+            // ==========================Save match visualization (optional)
+            // cv::Mat match_img;
+            // cv::drawMatches(imgs[m.src_img_idx], features[m.src_img_idx].keypoints,
+            //                imgs[m.dst_img_idx], features[m.dst_img_idx].keypoints,
+            //                m.matches, match_img);
+            // cv::imwrite("debug_matches_" + std::to_string(m.src_img_idx) + "_" + 
+            //             std::to_string(m.dst_img_idx) + ".jpg", match_img);
         }
     }
     
