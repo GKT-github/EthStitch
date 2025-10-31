@@ -29,7 +29,7 @@ private:
         void saveData(const std::string& = std::string()) const;
 public:
         SVAutoCalib(const size_t num_imgs, const size_t patch_size_ = 24, const size_t pyr_levels_ = 5, const size_t threshold_features_ = 32,
-                  const double conf_thresh_=0.40, const double match_conf_=0.3, const int maxpoints_=5000)
+                  const double conf_thresh_=0.85, const double match_conf_=0.65, const int maxpoints_=2500)
             : imgs_num(num_imgs), conf_thresh(conf_thresh_), match_conf(match_conf_), maxpoints(maxpoints_),
               patch_size(patch_size_), pyr_levels(pyr_levels_), threshold_features(threshold_features_)
         {assert(num_imgs > 0);}
